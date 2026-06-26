@@ -1,14 +1,17 @@
 import os
 import re
 import asyncio
+import csv
+import io
 import psycopg2
 import requests
 from datetime import date, datetime
 from playwright.async_api import async_playwright
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT  = os.environ["TELEGRAM_CHAT_ID"]
-DB_URL         = os.environ["DATABASE_URL"]
+TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT   = os.environ["TELEGRAM_CHAT_ID"]
+DB_URL          = os.environ["DATABASE_URL"]
+SHEETS_CSV_URL  = os.environ["SHEETS_CSV_URL"]
 
 def get_db():
     return psycopg2.connect(DB_URL)
@@ -18,16 +21,47 @@ def send_telegram(message: str):
     for chunk in [message[i:i+4000] for i in range(0, len(message), 4000)]:
         requests.post(url, json={"chat_id": TELEGRAM_CHAT, "text": chunk, "parse_mode": "HTML"})
 
+def fetch_clients_from_sheet() -> list:
+    resp = requests.get(SHEETS_CSV_URL, timeout=30)
+    resp.raise_for_status()
+    clients = []
+    for row in csv.reader(io.StringIO(resp.text)):
+        row = [c.strip() for c in row]
+        if len(row) >= 2:
+            name, maps_url = row[0], row[1]
+        elif len(row) == 1:
+            name = maps_url = row[0]
+        else:
+            continue
+        # Skip header rows and anything that isn't a real URL
+        if not maps_url.startswith("http"):
+            continue
+        clients.append({"name": name, "maps_url": maps_url})
+    return clients
+
+def sync_clients_to_db(clients: list):
+    conn = get_db()
+    cur = conn.cursor()
+    for c in clients:
+        cur.execute("""
+            INSERT INTO clients (name, maps_url)
+            VALUES (%s, %s)
+            ON CONFLICT (maps_url) DO UPDATE SET name = EXCLUDED.name
+        """, (c["name"], c["maps_url"]))
+    conn.commit()
+    cur.execute("SELECT id, name, maps_url FROM clients ORDER BY id")
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return [{"id": r[0], "name": r[1], "maps_url": r[2]} for r in rows]
+
 async def scrape_location(context, url: str, name: str) -> dict:
     page = await context.new_page()
     try:
         await page.goto(url, wait_until="networkidle", timeout=45000)
         await page.wait_for_timeout(2500)
-
         rating = None
         review_count = None
 
-        # Strategy 1: div.F7nice — the standard rating block on Google Maps
         try:
             el = await page.query_selector("div.F7nice")
             if el:
@@ -45,7 +79,6 @@ async def scrape_location(context, url: str, name: str) -> dict:
         except Exception:
             pass
 
-        # Strategy 2: aria-label like "4.5 stars"
         if rating is None:
             try:
                 for el in await page.query_selector_all("span[aria-label]"):
@@ -58,7 +91,6 @@ async def scrape_location(context, url: str, name: str) -> dict:
             except Exception:
                 pass
 
-        # Strategy 3: page title sometimes has "4.5 ★"
         if rating is None:
             try:
                 title = await page.title()
@@ -108,7 +140,7 @@ def log_change(client_id, client_name, change_type, old_val, new_val):
 
 async def run_all(clients):
     changes = []
-    sem = asyncio.Semaphore(3)  # 3 pages at a time max
+    sem = asyncio.Semaphore(3)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -129,9 +161,9 @@ async def run_all(clients):
                     print(f"  Could not read data for {client['name']}")
                     return
 
-                rating = data["rating"]
+                rating       = data["rating"]
                 review_count = data["review_count"]
-                last = get_last_snapshot(client["id"])
+                last         = get_last_snapshot(client["id"])
                 save_snapshot(client["id"], rating, review_count)
 
                 if not last:
@@ -163,17 +195,22 @@ async def run_all(clients):
 
 def main():
     print(f"[{datetime.now()}] GMB Monitor starting...")
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id, name, maps_url FROM clients ORDER BY id")
-    clients = [{"id": r[0], "name": r[1], "maps_url": r[2]} for r in cur.fetchall()]
-    cur.close(); conn.close()
 
-    if not clients:
-        send_telegram("⚠️ GMB Monitor: No clients in database yet. Add them via add_clients.py.")
+    print("Reading client list from Google Sheet...")
+    try:
+        sheet_clients = fetch_clients_from_sheet()
+    except Exception as e:
+        send_telegram(f"⚠️ GMB Monitor: Could not read Google Sheet — {e}")
         return
 
-    print(f"Checking {len(clients)} clients...")
+    if not sheet_clients:
+        send_telegram("⚠️ GMB Monitor: No clients found in sheet. Check your SHEETS_CSV_URL secret and make sure the sheet has URLs starting with http.")
+        return
+
+    print(f"Found {len(sheet_clients)} clients. Syncing to DB...")
+    clients = sync_clients_to_db(sheet_clients)
+
+    print(f"Scraping {len(clients)} locations...")
     changes = asyncio.run(run_all(clients))
 
     today = date.today()
