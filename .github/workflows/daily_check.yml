@@ -2,13 +2,12 @@ name: GMB Daily Check
 
 on:
   schedule:
-    - cron: '30 2 * * *'   # 8:00 AM IST every day
-  workflow_dispatch:         # also lets you trigger it manually
+    - cron: '30 2 * * *'
+  workflow_dispatch:
 
 jobs:
   check:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -18,7 +17,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Python packages
+      - name: Install dependencies
         run: pip install requests psycopg2-binary playwright
 
       - name: Install Playwright browser
@@ -29,4 +28,5 @@ jobs:
           TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DATABASE_URL:     ${{ secrets.DATABASE_URL }}
+          SHEETS_CSV_URL:   ${{ secrets.SHEETS_CSV_URL }}
         run: python checker.py
