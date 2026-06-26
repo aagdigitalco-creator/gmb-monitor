@@ -1,164 +1,333 @@
-// supabase/functions/oauth-exchange/index.ts
-//
-// Receives the Google PKCE auth code from docs/index.html, exchanges it
-// for tokens (this is the one step that needs the Google client_secret,
-// which is why it has to happen here instead of in the browser), looks
-// up the GMB account + email, and upserts the client row in Supabase.
-//
-// Secrets this function needs (set these in the Supabase dashboard,
-// Edge Functions -> oauth-exchange -> Secrets — never put them in code
-// or in git):
-//   GOOGLE_CLIENT_ID
-//   GOOGLE_CLIENT_SECRET
-// SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are injected automatically
-// by Supabase for every Edge Function, so they don't need to be set.
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GMB Monitor — Authorize Client</title>
+<style>
+  :root{
+    --bg:#0B0E11;
+    --panel:#13171C;
+    --line:#222831;
+    --text:#ECEFF2;
+    --muted:#8A93A0;
+    --accent:#FF6B35;
+    --accent-press:#E0571F;
+    --good:#2ED586;
+    --bad:#FF5C5C;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    min-height:100vh;
+    background:var(--bg);
+    color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    padding:20px;
+  }
+  .card{
+    width:100%;
+    max-width:420px;
+    background:var(--panel);
+    border:1px solid var(--line);
+    border-radius:14px;
+    padding:28px 24px 24px;
+  }
+  .eyebrow{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:12px;
+    letter-spacing:.12em;
+    text-transform:uppercase;
+    color:var(--muted);
+    margin:0 0 6px;
+  }
+  h1{
+    font-size:22px;
+    margin:0 0 22px;
+    font-weight:650;
+    letter-spacing:-.01em;
+  }
+  label{
+    display:block;
+    font-size:13px;
+    color:var(--muted);
+    margin-bottom:8px;
+  }
+  input[type=text]{
+    width:100%;
+    background:#0E1217;
+    border:1px solid var(--line);
+    color:var(--text);
+    font-size:16px;
+    padding:14px 14px;
+    border-radius:9px;
+    outline:none;
+    margin-bottom:18px;
+  }
+  input[type=text]:focus{
+    border-color:var(--accent);
+  }
+  button{
+    width:100%;
+    background:var(--accent);
+    color:#1A0E07;
+    border:none;
+    font-size:16px;
+    font-weight:650;
+    padding:16px;
+    border-radius:9px;
+    cursor:pointer;
+  }
+  button:active{ background:var(--accent-press); }
+  button:disabled{ opacity:.5; cursor:default; }
+  .hint{
+    font-size:12px;
+    color:var(--muted);
+    margin-top:14px;
+    line-height:1.5;
+  }
+  .state{
+    display:none;
+    text-align:center;
+    padding:10px 0 4px;
+  }
+  .state.show{ display:block; }
+  .spinner{
+    width:34px;height:34px;
+    border-radius:50%;
+    border:3px solid var(--line);
+    border-top-color:var(--accent);
+    margin:0 auto 18px;
+    animation:spin 0.8s linear infinite;
+  }
+  @keyframes spin{ to{ transform:rotate(360deg); } }
+  .badge{
+    width:46px;height:46px;
+    border-radius:50%;
+    margin:0 auto 16px;
+    display:flex;align-items:center;justify-content:center;
+    font-size:22px;
+  }
+  .badge.good{ background:rgba(46,213,134,.12); color:var(--good); }
+  .badge.bad{ background:rgba(255,92,92,.12); color:var(--bad); }
+  .state h2{ font-size:17px; margin:0 0 8px; }
+  .state p{ font-size:14px; color:var(--muted); margin:0 0 22px; line-height:1.5; word-break:break-word; }
+  .ghost-btn{
+    background:transparent;
+    border:1px solid var(--line);
+    color:var(--text);
+  }
+  .ghost-btn:active{ background:var(--line); }
+</style>
+</head>
+<body>
 
-// Lock this down to the actual GitHub Pages origin.
-const ALLOWED_ORIGIN = "https://aagdigitalco-creator.github.io";
+  <div class="card">
+    <div class="eyebrow">GMB Monitor</div>
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
-  "Access-Control-Allow-Headers": "content-type, authorization, apikey, x-client-info",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-};
+    <!-- FORM STATE -->
+    <div id="formState">
+      <h1>Authorize a client</h1>
+      <label for="clientName">Client name</label>
+      <input type="text" id="clientName" placeholder="e.g. Sunrise Dental — Surrey" autocomplete="off">
+      <button id="authBtn">Authorize with Google</button>
+      <p class="hint">This opens Google's login screen. Sign in with the client's own Google account and tap Allow. You'll land back here automatically.</p>
+    </div>
 
-function json(body: unknown, status = 200) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
-  });
+    <!-- REDIRECTING STATE -->
+    <div id="redirectState" class="state">
+      <div class="spinner"></div>
+      <h2>Opening Google sign-in…</h2>
+    </div>
+
+    <!-- PROCESSING STATE -->
+    <div id="processingState" class="state">
+      <div class="spinner"></div>
+      <h2>Saving <span id="processingName"></span>…</h2>
+      <p>Fetching tokens and writing to Supabase.</p>
+    </div>
+
+    <!-- SUCCESS STATE -->
+    <div id="successState" class="state">
+      <div class="badge good">✓</div>
+      <h2>Client saved</h2>
+      <p id="successMsg"></p>
+      <button class="ghost-btn" id="addAnotherBtn">Authorize another client</button>
+    </div>
+
+    <!-- ERROR STATE -->
+    <div id="errorState" class="state">
+      <div class="badge bad">!</div>
+      <h2>Something went wrong</h2>
+      <p id="errorMsg"></p>
+      <button class="ghost-btn" id="retryBtn">Try again</button>
+    </div>
+  </div>
+
+<script>
+// ---- Config -----------------------------------------------------------
+const GOOGLE_CLIENT_ID = "817921157558-eq3ocskmc8gvkg5i7igcnqeeviv93oc3.apps.googleusercontent.com";
+// Must match EXACTLY what's registered in Google Cloud Console, trailing
+// slash included. GitHub Pages serves a /docs index.html as the trailing-
+// slash directory URL, so that's what's used here.
+const REDIRECT_URI = "https://aagdigitalco-creator.github.io/gmb-monitor/";
+const EDGE_FUNCTION_URL = "https://utgdxyntajkeibmwhglb.supabase.co/functions/v1/oauth-exchange";
+const SUPABASE_ANON_KEY = "sb_publishable_ZICC9gfSRnFnukZUgh9zHg_CQM8Ji1E";
+const SCOPES = [
+  "https://www.googleapis.com/auth/business.manage",
+  "email",
+  "openid",
+].join(" ");
+
+// ---- Tiny view helper ---------------------------------------------------
+const views = ["formState","redirectState","processingState","successState","errorState"];
+function show(view){
+  views.forEach(v => document.getElementById(v).classList.toggle("show", v === view));
+  document.getElementById("formState").style.display = view === "formState" ? "block" : "none";
 }
 
-Deno.serve(async (req) => {
-  if (req.method === "OPTIONS") {
-    return new Response("ok", { headers: corsHeaders });
+// ---- PKCE helpers ---------------------------------------------------
+function base64URLEncode(buffer){
+  return btoa(String.fromCharCode(...new Uint8Array(buffer)))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function randomVerifier(){
+  const arr = new Uint8Array(64);
+  crypto.getRandomValues(arr);
+  return base64URLEncode(arr.buffer);
+}
+async function challengeFromVerifier(verifier){
+  const data = new TextEncoder().encode(verifier);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return base64URLEncode(digest);
+}
+function randomState(){
+  const arr = new Uint8Array(16);
+  crypto.getRandomValues(arr);
+  return base64URLEncode(arr.buffer);
+}
+
+// ---- Step 1: kick off the Google login ---------------------------------
+async function startAuth(){
+  const name = document.getElementById("clientName").value.trim();
+  if(!name){
+    document.getElementById("clientName").focus();
+    return;
   }
-  if (req.method !== "POST") {
-    return json({ ok: false, error: "Method not allowed" }, 405);
+  document.getElementById("authBtn").disabled = true;
+
+  const verifier = randomVerifier();
+  const challenge = await challengeFromVerifier(verifier);
+  const state = randomState();
+
+  sessionStorage.setItem("gmb_pending", JSON.stringify({ name, verifier, state }));
+
+  const params = new URLSearchParams({
+    client_id: GOOGLE_CLIENT_ID,
+    redirect_uri: REDIRECT_URI,
+    response_type: "code",
+    scope: SCOPES,
+    access_type: "offline",
+    prompt: "consent",
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    state: state,
+  });
+
+  show("redirectState");
+  window.location.href = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+}
+
+// ---- Step 2: handle the redirect back from Google -----------------------
+async function handleCallback(){
+  const url = new URL(window.location.href);
+  const code = url.searchParams.get("code");
+  const errorParam = url.searchParams.get("error");
+  const returnedState = url.searchParams.get("state");
+
+  if(!code && !errorParam) return; // normal form load, nothing to do
+
+  // Clean the URL so a refresh doesn't replay the same code.
+  window.history.replaceState({}, document.title, window.location.pathname);
+
+  const pendingRaw = sessionStorage.getItem("gmb_pending");
+  sessionStorage.removeItem("gmb_pending");
+
+  if(errorParam){
+    show("errorState");
+    document.getElementById("errorMsg").textContent =
+      errorParam === "access_denied"
+        ? "The client declined access on the Google screen."
+        : `Google returned an error: ${errorParam}`;
+    return;
   }
 
-  try {
-    const { name, code, code_verifier, redirect_uri } = await req.json();
+  if(!pendingRaw){
+    show("errorState");
+    document.getElementById("errorMsg").textContent =
+      "Lost track of this authorization (session storage was cleared). Please start again.";
+    return;
+  }
 
-    if (!name || !code || !code_verifier || !redirect_uri) {
-      return json({ ok: false, error: "Missing required fields" }, 400);
-    }
+  const pending = JSON.parse(pendingRaw);
 
-    const GOOGLE_CLIENT_ID = Deno.env.get("GOOGLE_CLIENT_ID")!;
-    const GOOGLE_CLIENT_SECRET = Deno.env.get("GOOGLE_CLIENT_SECRET")!;
-    const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
-    const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+  if(pending.state !== returnedState){
+    show("errorState");
+    document.getElementById("errorMsg").textContent = "Security check failed (state mismatch). Please try again.";
+    return;
+  }
 
-    // 1. Exchange the auth code for tokens. This is the step that needs
-    //    the client_secret, so it has to run here, not in the browser.
-    const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        code,
-        client_id: GOOGLE_CLIENT_ID,
-        client_secret: GOOGLE_CLIENT_SECRET,
-        redirect_uri,
-        grant_type: "authorization_code",
-        code_verifier,
-      }),
-    });
-    const tokenData = await tokenRes.json();
+  document.getElementById("processingName").textContent = pending.name;
+  show("processingState");
 
-    if (!tokenRes.ok) {
-      return json(
-        { ok: false, error: `Google token exchange failed: ${tokenData.error_description || tokenData.error}` },
-        400,
-      );
-    }
-
-    const { access_token, refresh_token, expires_in } = tokenData;
-
-    if (!refresh_token) {
-      return json(
-        {
-          ok: false,
-          error:
-            "Google didn't return a refresh token. This usually means this Google account already authorized the app before. Have the client remove access at https://myaccount.google.com/permissions and try again.",
-        },
-        400,
-      );
-    }
-
-    // 2. Get the email of the Google account that just authorized.
-    let email: string | null = null;
-    try {
-      const userRes = await fetch("https://www.googleapis.com/oauth2/v2/userinfo", {
-        headers: { Authorization: `Bearer ${access_token}` },
-      });
-      if (userRes.ok) {
-        const userData = await userRes.json();
-        email = userData.email ?? null;
-      }
-    } catch {
-      // Non-fatal — we can still save the client without an email.
-    }
-
-    // 3. Find the GMB account ID tied to this login.
-    const acctRes = await fetch(
-      "https://mybusinessaccountmanagement.googleapis.com/v1/accounts",
-      { headers: { Authorization: `Bearer ${access_token}` } },
-    );
-    const acctData = await acctRes.json();
-
-    if (!acctRes.ok) {
-      return json(
-        { ok: false, error: `GBP Account API error (${acctRes.status}): ${JSON.stringify(acctData)}` },
-        400,
-      );
-    }
-    if (!acctData.accounts || acctData.accounts.length === 0) {
-      return json(
-        { ok: false, error: `GBP API returned no accounts. Full response: ${JSON.stringify(acctData)}` },
-        400,
-      );
-    }
-
-    const account = acctData.accounts[0];
-    const accountId = account.name.split("/")[1]; // "accounts/12345" -> "12345"
-    const extraAccountsNote =
-      acctData.accounts.length > 1
-        ? ` Note: this login manages ${acctData.accounts.length} GMB accounts — only the first ("${account.accountName}") was saved.`
-        : "";
-
-    // 4. Save (or update) the client row in Supabase.
-    const tokenExpiry = new Date(Date.now() + expires_in * 1000).toISOString();
-
-    const upsertRes = await fetch(`${SUPABASE_URL}/rest/v1/clients?on_conflict=account_id`, {
+  try{
+    const res = await fetch(EDGE_FUNCTION_URL, {
       method: "POST",
       headers: {
-        apikey: SERVICE_ROLE_KEY,
-        Authorization: `Bearer ${SERVICE_ROLE_KEY}`,
         "Content-Type": "application/json",
-        Prefer: "resolution=merge-duplicates,return=representation",
+        "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
+        "apikey": SUPABASE_ANON_KEY,
       },
-      body: JSON.stringify([
-        {
-          name,
-          email,
-          account_id: accountId,
-          access_token,
-          refresh_token,
-          token_expiry: tokenExpiry,
-        },
-      ]),
+      body: JSON.stringify({
+        name: pending.name,
+        code,
+        code_verifier: pending.verifier,
+        redirect_uri: REDIRECT_URI,
+      }),
     });
+    const data = await res.json();
 
-    if (!upsertRes.ok) {
-      const errText = await upsertRes.text();
-      return json({ ok: false, error: `Saved tokens but failed to write to Supabase: ${errText}` }, 500);
+    if(data.ok){
+      show("successState");
+      document.getElementById("successMsg").textContent = data.message;
+    } else {
+      show("errorState");
+      document.getElementById("errorMsg").textContent = data.error || "Unknown error saving the client.";
     }
-
-    return json({
-      ok: true,
-      message: `Saved "${name}" (${email ?? "no email"}, account ${accountId}).${extraAccountsNote}`,
-    });
-  } catch (err) {
-    return json({ ok: false, error: `Unexpected error: ${err instanceof Error ? err.message : String(err)}` }, 500);
+  } catch(err){
+    show("errorState");
+    document.getElementById("errorMsg").textContent = `Network error: ${err.message}`;
   }
+}
+
+// ---- Wiring ---------------------------------------------------------
+document.getElementById("authBtn").addEventListener("click", startAuth);
+document.getElementById("retryBtn").addEventListener("click", () => {
+  document.getElementById("clientName").value = "";
+  document.getElementById("authBtn").disabled = false;
+  show("formState");
 });
+document.getElementById("addAnotherBtn").addEventListener("click", () => {
+  document.getElementById("clientName").value = "";
+  document.getElementById("authBtn").disabled = false;
+  show("formState");
+});
+
+show("formState");
+handleCallback();
+</script>
+</body>
+</html>
