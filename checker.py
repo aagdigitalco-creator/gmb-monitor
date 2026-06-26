@@ -1,228 +1,187 @@
 import os
-import json
-import requests
+import re
+import asyncio
 import psycopg2
+import requests
 from datetime import date, datetime
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
+from playwright.async_api import async_playwright
 
-# ── ENV VARS ──────────────────────────────────────────────────────────────────
-CLIENT_ID      = os.environ["GOOGLE_CLIENT_ID"]
-CLIENT_SECRET  = os.environ["GOOGLE_CLIENT_SECRET"]
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT  = os.environ["TELEGRAM_CHAT_ID"]
 DB_URL         = os.environ["DATABASE_URL"]
 
-SCOPES = ["https://www.googleapis.com/auth/business.manage"]
-
-# ── DATABASE ──────────────────────────────────────────────────────────────────
 def get_db():
     return psycopg2.connect(DB_URL)
 
-# ── TELEGRAM ──────────────────────────────────────────────────────────────────
 def send_telegram(message: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    chunks = [message[i:i+4000] for i in range(0, len(message), 4000)]
-    for chunk in chunks:
+    for chunk in [message[i:i+4000] for i in range(0, len(message), 4000)]:
         requests.post(url, json={"chat_id": TELEGRAM_CHAT, "text": chunk, "parse_mode": "HTML"})
 
-# ── TOKEN REFRESH ─────────────────────────────────────────────────────────────
-def refresh_creds(client: dict) -> str:
-    creds = Credentials(
-        token=client["access_token"],
-        refresh_token=client["refresh_token"],
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=CLIENT_ID,
-        client_secret=CLIENT_SECRET,
-        scopes=SCOPES,
-    )
-    if creds.expired or not creds.valid:
-        creds.refresh(Request())
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE clients SET access_token=%s, token_expiry=%s WHERE account_id=%s",
-            (creds.token, creds.expiry, client["account_id"])
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
-    return creds.token
+async def scrape_location(context, url: str, name: str) -> dict:
+    page = await context.new_page()
+    try:
+        await page.goto(url, wait_until="networkidle", timeout=45000)
+        await page.wait_for_timeout(2500)
 
-# ── GMB API ───────────────────────────────────────────────────────────────────
-def get_locations(account_id: str, token: str) -> list:
-    headers = {"Authorization": f"Bearer {token}"}
-    url = f"https://mybusinessbusinessinformation.googleapis.com/v1/{account_id}/locations"
-    params = {"readMask": "name,title,storefrontAddress,websiteUri,regularHours,phoneNumbers,categories"}
-    resp = requests.get(url, headers=headers, params=params)
-    data = resp.json()
-    if "error" in data:
-        print(f"Location fetch error for {account_id}: {data['error']}")
-        return []
-    return data.get("locations", [])
+        rating = None
+        review_count = None
 
-def get_reviews(account_id: str, location_id: str, token: str) -> dict:
-    headers = {"Authorization": f"Bearer {token}"}
-    url = f"https://mybusiness.googleapis.com/v4/{account_id}/{location_id}/reviews"
-    resp = requests.get(url, headers=headers)
-    data = resp.json()
-    if "error" in data:
-        return {"count": 0, "average": 0.0, "reviews": []}
-    return {
-        "count": data.get("totalReviewCount", 0),
-        "average": float(data.get("averageRating", 0)),
-        "reviews": data.get("reviews", [])
-    }
+        # Strategy 1: div.F7nice — the standard rating block on Google Maps
+        try:
+            el = await page.query_selector("div.F7nice")
+            if el:
+                text = await el.inner_text()
+                lines = text.strip().split("\n")
+                if lines:
+                    try:
+                        rating = float(lines[0].strip())
+                    except ValueError:
+                        pass
+                if len(lines) > 1:
+                    digits = re.sub(r"[^\d]", "", lines[1])
+                    if digits:
+                        review_count = int(digits)
+        except Exception:
+            pass
 
-# ── SNAPSHOT & CHANGE DETECTION ───────────────────────────────────────────────
-def get_last_snapshot(account_id, location_id):
+        # Strategy 2: aria-label like "4.5 stars"
+        if rating is None:
+            try:
+                for el in await page.query_selector_all("span[aria-label]"):
+                    label = (await el.get_attribute("aria-label") or "").lower()
+                    if "star" in label:
+                        m = re.search(r"(\d+\.?\d*)", label)
+                        if m:
+                            rating = float(m.group(1))
+                            break
+            except Exception:
+                pass
+
+        # Strategy 3: page title sometimes has "4.5 ★"
+        if rating is None:
+            try:
+                title = await page.title()
+                m = re.search(r"(\d+\.?\d*)\s*[★⭐]", title)
+                if m:
+                    rating = float(m.group(1))
+            except Exception:
+                pass
+
+        return {"rating": rating, "review_count": review_count, "ok": rating is not None}
+    except Exception as e:
+        print(f"  Scrape error for {name}: {e}")
+        return {"rating": None, "review_count": None, "ok": False}
+    finally:
+        await page.close()
+
+def get_last_snapshot(client_id):
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
-        SELECT data, review_count, average_rating FROM location_snapshots
-        WHERE account_id=%s AND location_id=%s
-        ORDER BY snapshot_date DESC LIMIT 1
-    """, (account_id, location_id))
+        SELECT rating, review_count FROM location_snapshots
+        WHERE client_id = %s ORDER BY snapshot_date DESC LIMIT 1
+    """, (client_id,))
     row = cur.fetchone()
-    cur.close()
-    conn.close()
+    cur.close(); conn.close()
     return row
 
-def save_snapshot(account_id, location_id, location_name, data, review_data):
+def save_snapshot(client_id, rating, review_count):
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO location_snapshots
-            (account_id, location_id, location_name, snapshot_date, data, review_count, average_rating)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (account_id, location_id, snapshot_date) DO UPDATE SET
-            data=EXCLUDED.data, review_count=EXCLUDED.review_count, average_rating=EXCLUDED.average_rating
-    """, (account_id, location_id, location_name, date.today(),
-          json.dumps(data), review_data["count"], review_data["average"]))
-    conn.commit()
-    cur.close()
-    conn.close()
+        INSERT INTO location_snapshots (client_id, snapshot_date, rating, review_count)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (client_id, snapshot_date) DO UPDATE SET
+            rating = EXCLUDED.rating, review_count = EXCLUDED.review_count
+    """, (client_id, date.today(), rating, review_count))
+    conn.commit(); cur.close(); conn.close()
 
-def log_change(account_id, location_id, location_name, change):
+def log_change(client_id, client_name, change_type, old_val, new_val):
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO change_log (account_id, location_id, location_name, change_type, old_value, new_value)
-        VALUES (%s, %s, %s, %s, %s, %s)
-    """, (account_id, location_id, location_name, change["type"],
-          json.dumps({"value": change.get("old")}), json.dumps({"value": change.get("new")})))
-    conn.commit()
-    cur.close()
-    conn.close()
+        INSERT INTO change_log (client_id, client_name, change_type, old_value, new_value)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (client_id, client_name, change_type, str(old_val), str(new_val)))
+    conn.commit(); cur.close(); conn.close()
 
-def detect_changes(account_id, location_id, location_name, today_loc, review_data) -> list:
-    row = get_last_snapshot(account_id, location_id)
-    if not row:
-        return []  # first time, no comparison
-
-    prev_data, prev_count, prev_avg = row
+async def run_all(clients):
     changes = []
+    sem = asyncio.Semaphore(3)  # 3 pages at a time max
 
-    # Review count
-    today_count = review_data["count"]
-    if today_count != prev_count:
-        diff = today_count - (prev_count or 0)
-        new_reviews = review_data["reviews"][:max(diff, 0)]
-        changes.append({"type": "review_count", "old": prev_count, "new": today_count,
-                        "diff": diff, "new_reviews": new_reviews})
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+        )
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800},
+        )
 
-    # Average rating
-    today_avg = round(review_data["average"], 1)
-    if today_avg != round(float(prev_avg or 0), 1):
-        changes.append({"type": "rating_changed", "old": prev_avg, "new": today_avg})
+        async def process(client):
+            async with sem:
+                await asyncio.sleep(1)
+                print(f"  Checking: {client['name']}")
+                data = await scrape_location(context, client["maps_url"], client["name"])
+                if not data["ok"]:
+                    print(f"  Could not read data for {client['name']}")
+                    return
 
-    # Business info fields
-    for field in ["title", "websiteUri", "phoneNumbers", "storefrontAddress"]:
-        old_val = (prev_data or {}).get(field)
-        new_val = today_loc.get(field)
-        if json.dumps(old_val, sort_keys=True) != json.dumps(new_val, sort_keys=True):
-            changes.append({"type": "info_changed", "field": field, "old": old_val, "new": new_val})
+                rating = data["rating"]
+                review_count = data["review_count"]
+                last = get_last_snapshot(client["id"])
+                save_snapshot(client["id"], rating, review_count)
+
+                if not last:
+                    print(f"  First snapshot saved for {client['name']}")
+                    return
+
+                prev_rating, prev_count = last
+                msgs = []
+
+                if rating is not None and prev_rating is not None:
+                    if round(float(rating), 1) != round(float(prev_rating), 1):
+                        msgs.append(f"📊 Rating: {prev_rating} → <b>{rating}</b>")
+                        log_change(client["id"], client["name"], "rating_changed", prev_rating, rating)
+
+                if review_count is not None and prev_count is not None:
+                    diff = int(review_count) - int(prev_count)
+                    if diff != 0:
+                        sign = "+" if diff > 0 else ""
+                        msgs.append(f"⭐ Reviews: {prev_count} → <b>{review_count}</b> ({sign}{diff})")
+                        log_change(client["id"], client["name"], "review_count_changed", prev_count, review_count)
+
+                if msgs:
+                    changes.append(f"📍 <b>{client['name']}</b>\n" + "\n".join(msgs))
+
+        await asyncio.gather(*[process(c) for c in clients])
+        await browser.close()
 
     return changes
 
-# ── FORMAT MESSAGE ────────────────────────────────────────────────────────────
-def format_message(location_name, changes) -> str:
-    lines = [f"📍 <b>{location_name}</b>"]
-    for c in changes:
-        if c["type"] == "review_count":
-            diff = c["diff"]
-            sign = "+" if diff > 0 else ""
-            lines.append(f"⭐ Reviews: {c['old']} → <b>{c['new']}</b> ({sign}{diff})")
-            for r in c.get("new_reviews", []):
-                name    = r.get("reviewer", {}).get("displayName", "Anonymous")
-                stars   = r.get("starRating", "?")
-                comment = r.get("comment", "(no comment)")[:200]
-                lines.append(f"   └ {name} ({stars}★): {comment}")
-        elif c["type"] == "rating_changed":
-            lines.append(f"📊 Rating: {c['old']} → <b>{c['new']}</b>")
-        elif c["type"] == "info_changed":
-            labels = {"title": "Business Name", "websiteUri": "Website",
-                      "phoneNumbers": "Phone", "storefrontAddress": "Address"}
-            label = labels.get(c["field"], c["field"])
-            lines.append(f"✏️ {label} changed\n   Old: {c['old']}\n   New: {c['new']}")
-    return "\n".join(lines)
-
-# ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
-    print(f"[{datetime.now()}] GMB daily check starting...")
-
+    print(f"[{datetime.now()}] GMB Monitor starting...")
     conn = get_db()
-    cur  = conn.cursor()
-    cur.execute("SELECT name, account_id, access_token, refresh_token, token_expiry FROM clients")
-    clients = [{"name": r[0], "account_id": r[1], "access_token": r[2],
-                "refresh_token": r[3], "token_expiry": r[4]} for r in cur.fetchall()]
-    cur.close()
-    conn.close()
+    cur = conn.cursor()
+    cur.execute("SELECT id, name, maps_url FROM clients ORDER BY id")
+    clients = [{"id": r[0], "name": r[1], "maps_url": r[2]} for r in cur.fetchall()]
+    cur.close(); conn.close()
 
     if not clients:
-        send_telegram("⚠️ GMB Monitor: No clients found in database.")
+        send_telegram("⚠️ GMB Monitor: No clients in database yet. Add them via add_clients.py.")
         return
 
-    all_changes = []
-    total_locations = 0
+    print(f"Checking {len(clients)} clients...")
+    changes = asyncio.run(run_all(clients))
 
-    for client in clients:
-        try:
-            token     = refresh_creds(client)
-            locations = get_locations(client["account_id"], token)
-            total_locations += len(locations)
-
-            for loc in locations:
-                location_id   = loc["name"].split("/")[-1]
-                location_name = loc.get("title", location_id)
-                full_loc_id   = f"locations/{location_id}"
-
-                try:
-                    review_data = get_reviews(client["account_id"], full_loc_id, token)
-                except Exception as e:
-                    print(f"Review error for {location_name}: {e}")
-                    review_data = {"count": 0, "average": 0.0, "reviews": []}
-
-                changes = detect_changes(client["account_id"], location_id,
-                                         location_name, loc, review_data)
-                save_snapshot(client["account_id"], location_id, location_name,
-                              loc, review_data)
-
-                if changes:
-                    for c in changes:
-                        log_change(client["account_id"], location_id, location_name, c)
-                    all_changes.append(format_message(location_name, changes))
-
-        except Exception as e:
-            msg = f"⚠️ Error on client <b>{client['name']}</b>: {e}"
-            print(msg)
-            send_telegram(msg)
-
-    if all_changes:
-        header = f"🔔 <b>GMB Daily Report — {date.today()}</b>\n{len(all_changes)} location(s) changed\n\n"
-        send_telegram(header + "\n\n".join(all_changes))
+    today = date.today()
+    if changes:
+        header = f"🔔 <b>GMB Daily Report — {today}</b>\n{len(changes)} location(s) changed\n\n"
+        send_telegram(header + "\n\n".join(changes))
     else:
-        send_telegram(f"✅ <b>GMB Daily Report — {date.today()}</b>\nNo changes across {total_locations} locations.")
+        send_telegram(f"✅ <b>GMB Daily Report — {today}</b>\nNo changes across {len(clients)} locations.")
 
     print(f"[{datetime.now()}] Done.")
 
