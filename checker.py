@@ -1,226 +1,415 @@
+import asyncio
 import os
 import re
-import asyncio
 import csv
-import io
-import psycopg2
+import json
 import requests
-from datetime import date, datetime
+import psycopg2
+from datetime import date
 from playwright.async_api import async_playwright
 
-TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT   = os.environ["TELEGRAM_CHAT_ID"]
-DB_URL          = os.environ["DATABASE_URL"]
-SHEETS_CSV_URL  = os.environ["SHEETS_CSV_URL"]
+# ── ENV ───────────────────────────────────────────────────────────────────────
+TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+DATABASE_URL     = os.environ["DATABASE_URL"]
+SHEETS_CSV_URL   = os.environ["SHEETS_CSV_URL"]
 
-def get_db():
-    return psycopg2.connect(DB_URL)
+FIELD_LABELS = {
+    "rating":       "⭐ Rating",
+    "review_count": "💬 Reviews",
+    "name":         "🏷️ Name",
+    "address":      "📍 Address",
+    "phone":        "📞 Phone",
+    "website":      "🌐 Website",
+    "category":     "🗂️ Category",
+    "hours":        "🕐 Hours",
+    "status":       "🔴 Open/Closed Status",
+}
 
-def send_telegram(message: str):
+# ── TELEGRAM ──────────────────────────────────────────────────────────────────
+def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    for chunk in [message[i:i+4000] for i in range(0, len(message), 4000)]:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT, "text": chunk, "parse_mode": "HTML"})
+    # Telegram has a 4096 char limit — split if needed
+    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
+    for chunk in chunks:
+        requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": chunk,
+            "parse_mode": "HTML"
+        })
 
-def fetch_clients_from_sheet() -> list:
+# ── GOOGLE SHEET ──────────────────────────────────────────────────────────────
+def fetch_clients_from_sheet():
     resp = requests.get(SHEETS_CSV_URL, timeout=30)
     resp.raise_for_status()
+    reader = csv.reader(resp.text.splitlines())
     clients = []
-    for row in csv.reader(io.StringIO(resp.text)):
-        row = [c.strip() for c in row]
-        if len(row) >= 2:
-            name, maps_url = row[0], row[1]
-        elif len(row) == 1:
-            name = maps_url = row[0]
-        else:
+    for row in reader:
+        if len(row) < 2:
             continue
-        # Skip header rows and anything that isn't a real URL
-        if not maps_url.startswith("http"):
+        name, url = row[0].strip(), row[1].strip()
+        if not url.startswith("http"):
             continue
-        clients.append({"name": name, "maps_url": maps_url})
+        clients.append((name, url))
     return clients
 
-def sync_clients_to_db(clients: list):
-    conn = get_db()
-    cur = conn.cursor()
-    for c in clients:
-        cur.execute("""
-            INSERT INTO clients (name, maps_url)
-            VALUES (%s, %s)
-            ON CONFLICT (maps_url) DO UPDATE SET name = EXCLUDED.name
-        """, (c["name"], c["maps_url"]))
-    conn.commit()
-    cur.execute("SELECT id, name, maps_url FROM clients ORDER BY id")
-    rows = cur.fetchall()
-    cur.close(); conn.close()
-    return [{"id": r[0], "name": r[1], "maps_url": r[2]} for r in rows]
+# ── SCRAPING ──────────────────────────────────────────────────────────────────
+async def scrape_location(page, url):
+    data = {
+        "rating":       None,
+        "review_count": None,
+        "name":         None,
+        "address":      None,
+        "phone":        None,
+        "website":      None,
+        "category":     None,
+        "hours":        None,
+        "status":       None,
+    }
 
-async def scrape_location(context, url: str, name: str) -> dict:
-    page = await context.new_page()
     try:
-        await page.goto(url, wait_until="networkidle", timeout=45000)
-        await page.wait_for_timeout(2500)
-        rating = None
-        review_count = None
+        await page.goto(url, timeout=45000, wait_until="networkidle")
+        await page.wait_for_timeout(4000)
 
+        # ── NAME ──────────────────────────────────────────────────────────────
+        try:
+            el = await page.query_selector("h1")
+            if el:
+                data["name"] = (await el.inner_text()).strip()
+        except Exception:
+            pass
+
+        # ── RATING ────────────────────────────────────────────────────────────
         try:
             el = await page.query_selector("div.F7nice")
             if el:
                 text = await el.inner_text()
-                lines = text.strip().split("\n")
-                if lines:
-                    try:
-                        rating = float(lines[0].strip())
-                    except ValueError:
-                        pass
-                if len(lines) > 1:
-                    digits = re.sub(r"[^\d]", "", lines[1])
-                    if digits:
-                        review_count = int(digits)
+                m = re.search(r'(\d+[.,]\d+)', text)
+                if m:
+                    data["rating"] = round(float(m.group(1).replace(",", ".")), 1)
         except Exception:
             pass
 
-        if rating is None:
+        if data["rating"] is None:
             try:
                 for el in await page.query_selector_all("span[aria-label]"):
                     label = (await el.get_attribute("aria-label") or "").lower()
                     if "star" in label:
-                        m = re.search(r"(\d+\.?\d*)", label)
+                        m = re.search(r'(\d+[.,]\d+)', label)
                         if m:
-                            rating = float(m.group(1))
+                            data["rating"] = round(float(m.group(1).replace(",", ".")), 1)
                             break
             except Exception:
                 pass
 
-        if rating is None:
+        # ── REVIEW COUNT ──────────────────────────────────────────────────────
+        try:
+            for el in await page.query_selector_all("span[aria-label]"):
+                label = (await el.get_attribute("aria-label") or "").lower()
+                if "review" in label:
+                    m = re.search(r'([\d,]+)', label)
+                    if m:
+                        data["review_count"] = int(m.group(1).replace(",", ""))
+                        break
+        except Exception:
+            pass
+
+        if data["review_count"] is None:
             try:
-                title = await page.title()
-                m = re.search(r"(\d+\.?\d*)\s*[★⭐]", title)
-                if m:
-                    rating = float(m.group(1))
+                el = await page.query_selector("div.F7nice")
+                if el:
+                    text = await el.inner_text()
+                    # Rating block usually shows "4.5\n(120)" or "4.5(120)"
+                    m = re.search(r'\(([\d,]+)\)', text)
+                    if m:
+                        data["review_count"] = int(m.group(1).replace(",", ""))
             except Exception:
                 pass
 
-        return {"rating": rating, "review_count": review_count, "ok": rating is not None}
+        # ── ADDRESS ───────────────────────────────────────────────────────────
+        try:
+            selectors = [
+                "[data-item-id='address'] .Io6YTe",
+                "button[data-tooltip='Copy address'] .Io6YTe",
+                "button[aria-label*='ddress'] .Io6YTe",
+            ]
+            for sel in selectors:
+                el = await page.query_selector(sel)
+                if el:
+                    text = (await el.inner_text()).strip()
+                    if text:
+                        data["address"] = text
+                        break
+        except Exception:
+            pass
+
+        # ── PHONE ─────────────────────────────────────────────────────────────
+        try:
+            selectors = [
+                "[data-tooltip='Copy phone number'] .Io6YTe",
+                "[data-item-id^='phone:'] .Io6YTe",
+                "button[aria-label*='hone'] .Io6YTe",
+            ]
+            for sel in selectors:
+                el = await page.query_selector(sel)
+                if el:
+                    text = (await el.inner_text()).strip()
+                    if text:
+                        data["phone"] = text
+                        break
+        except Exception:
+            pass
+
+        # ── WEBSITE ───────────────────────────────────────────────────────────
+        try:
+            selectors = [
+                "a[data-item-id='authority']",
+                "a[data-tooltip='Open website']",
+                "a[aria-label*='ebsite']",
+            ]
+            for sel in selectors:
+                el = await page.query_selector(sel)
+                if el:
+                    href = await el.get_attribute("href")
+                    if href and href.startswith("http"):
+                        data["website"] = href
+                        break
+        except Exception:
+            pass
+
+        # ── CATEGORY ──────────────────────────────────────────────────────────
+        try:
+            selectors = [
+                "button.DkEaL",
+                "span.YhemCb",
+                "[jsaction*='category']",
+            ]
+            for sel in selectors:
+                el = await page.query_selector(sel)
+                if el:
+                    text = (await el.inner_text()).strip()
+                    if text:
+                        data["category"] = text
+                        break
+        except Exception:
+            pass
+
+        # ── HOURS (today's displayed hours) ───────────────────────────────────
+        try:
+            selectors = [
+                ".t39EBf .G8aQO",
+                ".o0Svhf",
+                "[data-item-id='oh'] .Io6YTe",
+                ".OqCZI .Io6YTe",
+            ]
+            for sel in selectors:
+                el = await page.query_selector(sel)
+                if el:
+                    text = (await el.inner_text()).strip()
+                    if text:
+                        data["hours"] = text
+                        break
+        except Exception:
+            pass
+
+        # ── OPEN / CLOSED STATUS ──────────────────────────────────────────────
+        try:
+            selectors = [
+                ".dHPLDd",
+                "span.ZDu9vd",
+                ".JzHdmf span",
+            ]
+            for sel in selectors:
+                el = await page.query_selector(sel)
+                if el:
+                    text = (await el.inner_text()).strip()
+                    if text:
+                        data["status"] = text
+                        break
+        except Exception:
+            pass
+
     except Exception as e:
-        print(f"  Scrape error for {name}: {e}")
-        return {"rating": None, "review_count": None, "ok": False}
-    finally:
-        await page.close()
+        print(f"  ✗ Fatal error scraping {url}: {e}")
 
-def get_last_snapshot(client_id):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT rating, review_count FROM location_snapshots
-        WHERE client_id = %s ORDER BY snapshot_date DESC LIMIT 1
-    """, (client_id,))
-    row = cur.fetchone()
-    cur.close(); conn.close()
-    return row
+    return data
 
-def save_snapshot(client_id, rating, review_count):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO location_snapshots (client_id, snapshot_date, rating, review_count)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (client_id, snapshot_date) DO UPDATE SET
-            rating = EXCLUDED.rating, review_count = EXCLUDED.review_count
-    """, (client_id, date.today(), rating, review_count))
-    conn.commit(); cur.close(); conn.close()
 
-def log_change(client_id, client_name, change_type, old_val, new_val):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO change_log (client_id, client_name, change_type, old_value, new_value)
-        VALUES (%s, %s, %s, %s, %s)
-    """, (client_id, client_name, change_type, str(old_val), str(new_val)))
-    conn.commit(); cur.close(); conn.close()
+# ── DB HELPERS ────────────────────────────────────────────────────────────────
+def get_db():
+    return psycopg2.connect(DATABASE_URL)
 
-async def run_all(clients):
-    changes = []
-    sem = asyncio.Semaphore(3)
+def upsert_clients(conn, clients):
+    with conn.cursor() as cur:
+        for name, url in clients:
+            cur.execute("""
+                INSERT INTO clients (name, maps_url)
+                VALUES (%s, %s)
+                ON CONFLICT (maps_url) DO UPDATE SET name = EXCLUDED.name
+            """, (name, url))
+    conn.commit()
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
-        )
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800},
-        )
+def get_all_clients(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, name, maps_url FROM clients ORDER BY id")
+        return cur.fetchall()
 
-        async def process(client):
-            async with sem:
-                await asyncio.sleep(1)
-                print(f"  Checking: {client['name']}")
-                data = await scrape_location(context, client["maps_url"], client["name"])
-                if not data["ok"]:
-                    print(f"  Could not read data for {client['name']}")
-                    return
+def get_last_snapshot(conn, client_id):
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT snapshot_data, rating, review_count
+            FROM location_snapshots
+            WHERE client_id = %s
+            ORDER BY snapshot_date DESC
+            LIMIT 1
+        """, (client_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        snapshot_data, rating, review_count = row
+        if snapshot_data:
+            return snapshot_data if isinstance(snapshot_data, dict) else json.loads(snapshot_data)
+        # Fallback: old snapshots that only had rating + review_count
+        if rating is not None or review_count is not None:
+            return {"rating": float(rating) if rating else None, "review_count": review_count}
+        return None
 
-                rating       = data["rating"]
-                review_count = data["review_count"]
-                last         = get_last_snapshot(client["id"])
-                save_snapshot(client["id"], rating, review_count)
+def save_snapshot(conn, client_id, today, data):
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO location_snapshots
+                (client_id, snapshot_date, rating, review_count, snapshot_data)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (client_id, snapshot_date) DO UPDATE SET
+                rating        = EXCLUDED.rating,
+                review_count  = EXCLUDED.review_count,
+                snapshot_data = EXCLUDED.snapshot_data
+        """, (
+            client_id,
+            today,
+            data.get("rating"),
+            data.get("review_count"),
+            json.dumps(data),
+        ))
+    conn.commit()
 
-                if not last:
-                    print(f"  First snapshot saved for {client['name']}")
-                    return
+def log_changes(conn, client_id, client_name, changes):
+    with conn.cursor() as cur:
+        for field, (old_val, new_val) in changes.items():
+            cur.execute("""
+                INSERT INTO change_log
+                    (client_id, client_name, change_type, old_value, new_value)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (client_id, client_name, field, str(old_val), str(new_val)))
+    conn.commit()
 
-                prev_rating, prev_count = last
-                msgs = []
+def detect_changes(old_data, new_data):
+    """Return {field: (old_value, new_value)} for every field that changed."""
+    if not old_data:
+        return {}  # First run — nothing to compare against
 
-                if rating is not None and prev_rating is not None:
-                    if round(float(rating), 1) != round(float(prev_rating), 1):
-                        msgs.append(f"📊 Rating: {prev_rating} → <b>{rating}</b>")
-                        log_change(client["id"], client["name"], "rating_changed", prev_rating, rating)
+    changes = {}
+    for field, new_val in new_data.items():
+        if new_val is None:
+            continue  # Scraping failed for this field today — skip
+        old_val = old_data.get(field)
+        if old_val is None:
+            continue  # No previous value — skip (don't false-alarm on first full run)
 
-                if review_count is not None and prev_count is not None:
-                    diff = int(review_count) - int(prev_count)
-                    if diff != 0:
-                        sign = "+" if diff > 0 else ""
-                        msgs.append(f"⭐ Reviews: {prev_count} → <b>{review_count}</b> ({sign}{diff})")
-                        log_change(client["id"], client["name"], "review_count_changed", prev_count, review_count)
-
-                if msgs:
-                    changes.append(f"📍 <b>{client['name']}</b>\n" + "\n".join(msgs))
-
-        await asyncio.gather(*[process(c) for c in clients])
-        await browser.close()
+        if field == "rating":
+            if float(old_val) != float(new_val):
+                changes[field] = (old_val, new_val)
+        elif field == "review_count":
+            if int(old_val) != int(new_val):
+                changes[field] = (old_val, new_val)
+        else:
+            if str(old_val).strip() != str(new_val).strip():
+                changes[field] = (old_val, new_val)
 
     return changes
 
-def main():
-    print(f"[{datetime.now()}] GMB Monitor starting...")
 
-    print("Reading client list from Google Sheet...")
-    try:
-        sheet_clients = fetch_clients_from_sheet()
-    except Exception as e:
-        send_telegram(f"⚠️ GMB Monitor: Could not read Google Sheet — {e}")
-        return
+# ── TELEGRAM MESSAGE ──────────────────────────────────────────────────────────
+def format_telegram_message(today, all_changes, total_clients):
+    date_str = today.strftime("%Y-%m-%d")
 
-    if not sheet_clients:
-        send_telegram("⚠️ GMB Monitor: No clients found in sheet. Check your SHEETS_CSV_URL secret and make sure the sheet has URLs starting with http.")
-        return
+    if not all_changes:
+        return f"✅ GMB Daily Report — {date_str}\nNo changes across {total_clients} locations."
 
-    print(f"Found {len(sheet_clients)} clients. Syncing to DB...")
-    clients = sync_clients_to_db(sheet_clients)
+    lines = [f"🔔 GMB Daily Report — {date_str}"]
+    lines.append(f"{len(all_changes)} location(s) changed\n")
 
-    print(f"Scraping {len(clients)} locations...")
-    changes = asyncio.run(run_all(clients))
+    for client_name, changes in all_changes.items():
+        lines.append(f"📍 <b>{client_name}</b>")
+        for field, (old_val, new_val) in changes.items():
+            label = FIELD_LABELS.get(field, field)
+            if field == "review_count":
+                diff = int(new_val) - int(old_val)
+                sign = "+" if diff > 0 else ""
+                lines.append(f"  {label}: {old_val} → {new_val} ({sign}{diff})")
+            elif field == "rating":
+                lines.append(f"  {label}: {old_val} → {new_val}")
+            else:
+                lines.append(f"  {label}:")
+                lines.append(f"    Before: {old_val}")
+                lines.append(f"    After:  {new_val}")
+        lines.append("")
 
+    return "\n".join(lines).strip()
+
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+async def main():
     today = date.today()
-    if changes:
-        header = f"🔔 <b>GMB Daily Report — {today}</b>\n{len(changes)} location(s) changed\n\n"
-        send_telegram(header + "\n\n".join(changes))
-    else:
-        send_telegram(f"✅ <b>GMB Daily Report — {today}</b>\nNo changes across {len(clients)} locations.")
+    print(f"=== GMB Monitor — {today} ===")
 
-    print(f"[{datetime.now()}] Done.")
+    print("Fetching client list from Google Sheet...")
+    sheet_clients = fetch_clients_from_sheet()
+    print(f"  {len(sheet_clients)} clients in sheet")
+
+    conn = get_db()
+    upsert_clients(conn, sheet_clients)
+    all_clients = get_all_clients(conn)
+    print(f"  {len(all_clients)} clients in DB\n")
+
+    semaphore = asyncio.Semaphore(3)
+    all_changes = {}
+    lock = asyncio.Lock()
+
+    async def process_client(client_id, name, url):
+        async with semaphore:
+            print(f"Scraping: {name}")
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page()
+                try:
+                    data = await scrape_location(page, url)
+                finally:
+                    await browser.close()
+
+            old_data = get_last_snapshot(conn, client_id)
+            changes  = detect_changes(old_data, data)
+            save_snapshot(conn, client_id, today, data)
+
+            if changes:
+                log_changes(conn, client_id, name, changes)
+                async with lock:
+                    all_changes[name] = changes
+                print(f"  ✓ {len(changes)} change(s): {', '.join(changes.keys())}")
+            else:
+                scraped = [k for k, v in data.items() if v is not None]
+                print(f"  ✓ No changes (scraped: {', '.join(scraped)})")
+
+    tasks = [process_client(cid, name, url) for cid, name, url in all_clients]
+    await asyncio.gather(*tasks)
+
+    conn.close()
+
+    msg = format_telegram_message(today, all_changes, len(all_clients))
+    print("\n" + msg)
+    send_telegram(msg)
+    print("\nDone.")
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
