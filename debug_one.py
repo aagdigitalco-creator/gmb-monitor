@@ -52,7 +52,7 @@ async def main():
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
 
-        await page.goto(url, timeout=45000, wait_until="documentsloaded")
+        await page.goto(url, timeout=45000, wait_until="load")
         await page.wait_for_timeout(5000)
 
         title = await page.title()
