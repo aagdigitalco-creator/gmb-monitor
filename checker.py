@@ -68,7 +68,7 @@ async def scrape_location(page, url):
     }
 
     try:
-        await page.goto(url, timeout=45000, wait_until="networkidle")
+        await page.goto(url, timeout=45000, wait_until="documentloaded")
         await page.wait_for_timeout(4000)
 
         # ── NAME ──────────────────────────────────────────────────────────────
