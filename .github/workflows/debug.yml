@@ -1,0 +1,24 @@
+name: Debug Scrape (run manually)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install requests psycopg2-binary playwright
+      - name: Install Chromium
+        run: playwright install chromium --with-deps
+      - name: Run debug scrape
+        run: python debug_one.py
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SHEETS_CSV_URL: ${{ secrets.SHEETS_CSV_URL }}
